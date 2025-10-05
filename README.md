@@ -1,4 +1,4 @@
-# Warm-Basis Project
+# Warm-Basis Iterative Projection Method
 
 **Goal:** Bridge learning and iteration for large-scale linear inverse problems  
 (case study: Fluorescence Molecular Tomography, FMT).
