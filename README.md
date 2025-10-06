@@ -28,6 +28,6 @@ Wb-IPM (MATLAB): R2022b+
 
 ## Citation
 ```text
-Guo, R., Jiang, J., Jin, B., Ren, W., Zhang, J.
+R. Guo, J. Jiang, B. Jin, W. Ren, J. Zhang.
 “A Warm-basis Method for Bridging Learning and Iteration: A Case Study in Fluorescence Molecular Tomography,” 2025.
 ```
