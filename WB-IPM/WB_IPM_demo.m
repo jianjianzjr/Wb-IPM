@@ -1,153 +1,203 @@
-%%
-root = 'D:\ZJR\11_initial_guess\InitialGuess_pytorch-master\data\simulation_FMT\test_545414_circle';
-attn_path = [root '\5_mse_em_noattn_0_1\100\'];
-close all;
-% attn_nonws_path = ['\9_Dnorm_0\100\'];
+%% Problem setup
 
-thr = 1e-4;
-tau = 1e-2;
-maxit = 30;
-recon_grd = [55,55,15];
-[m,n] = size(weighting_Matrix);
+data_path = './data/';
+load(fullfile(data_path, 'weighting_matrix.mat'));
+load(fullfile(data_path, 'mea_mask_array.mat'));
+
+recon_grd = [55, 55, 15];
 mask = mea_mask_array;
-trunc_options.nOuter = 1; % number of outer iterations
-trunc_options.nInner = maxit; % maximum storage of solution vector space
-trunc_options.max_mm = 200; % maminimum number of vectors to save at compression
-trunc_options.compress = 'SVD'; 
 
-index = 23;
-%
+%% Reconstruction
+
+root = './data/';
+attn_path = '/predicts/';
+index = 47;
 
 for i = index
-    %
-    gt_path = [root '/gt/' sprintf('%04d', i),'.mat'];
-    gt = load(gt_path);
-    fn = fieldnames(gt);
-    gt = gt.(fn{1});
-    gt = permute(gt,[3,2,1]);
-    
-    pred_path = [attn_path,sprintf('%04d', i),'-pred.mat'];
-    pred = load(pred_path);
-    fn = fieldnames(pred);
-    pred = pred.(fn{1});
-    attn_pred = permute(pred,[3,2,1]);
+    fprintf('Processing case %04d...\n', i);
 
-    measurements_path = [root '/measurements/' sprintf('%04d', i) '.mat'];
-    measurements = load(measurements_path);
-    fn = fieldnames(measurements);
-    measurements = measurements.(fn{1});
-    
-    [laser_n,xx,yy] = size(measurements);
-    pixel_n = xx*yy;
-    measure_array = zeros(pixel_n*laser_n,1);
-    temp_measurements = permute(measurements,[3,2,1]);
-    measurements_tmp = zeros([pixel_n,laser_n]);
+    measurements_path = [root '\measurements\' sprintf('%04d', i) '.mat'];
+    measurements_data = load(measurements_path);
+    fn = fieldnames(measurements_data);
+    measurements = measurements_data.(fn{1});
+
+    nlevel = 0.1;
+    e_full = randn(size(measurements));
+    e_full = e_full / norm(e_full(:)) * norm(measurements(:)) * nlevel;
+    measurements = measurements + e_full;
+
+    gt_path = [root '\gt\' sprintf('%04d', i) '.mat'];
+    gt_data = load(gt_path);
+    fn = fieldnames(gt_data);
+    gt = gt_data.(fn{1});
+    gt = permute(gt, [3, 2, 1]);
+
+    pred_path = [root attn_path sprintf('%04d', i) '-pred.mat'];
+    pred_data = load(pred_path);
+    fn = fieldnames(pred_data);
+    pred = pred_data.(fn{1});
+    pred = permute(pred, [3, 2, 1]);
+
+    if any(isnan(pred), 'all') || any(isinf(pred), 'all')
+        warning('Case %04d contains NaN or Inf values and is skipped.', i);
+        continue;
+    end
+
+    [laser_n, xx, yy] = size(measurements);
+    pixel_n = xx * yy;
+
+    temp_measurements = permute(measurements, [3, 2, 1]);
+    measurements_tmp = zeros(pixel_n, laser_n);
+
     for j = 1:laser_n
-        measurements_tmp(:,j) = reshape(temp_measurements(:,:,j), [],1);
-    end
-    
-    for j= 1:laser_n
-        measure_array(((j-1)*pixel_n+1):(pixel_n*j))=measurements_tmp(:,j);
+        measurements_tmp(:, j) = reshape(temp_measurements(:, :, j), [], 1);
     end
 
-    tmp_measure_array = measure_array(mask);
-    clear measure_array
-    measure_array = tmp_measure_array;
-    clear tmp_measure_array
-    
-    b = double(measure_array);
-    
-    nlevel= 0.1;
-    e = randn(size(b,1),1);
-    e=e/norm(e)*norm(b)*nlevel;
-    delta = norm(e);
-    bn = b(:) + e;
-    
-    nfig = 1;
-    Nr = 1;Nc = 1;
-    res_fact = [1,1,1];
-    mua_grd =gt;
-    mua_grd_temp = mua_grd;
-    for j = 1:size(mua_grd,3)
-        mua_grd_temp(:,:,j) = flip(mua_grd(:,:,j)',2);
+    measure_array = zeros(pixel_n * laser_n, 1);
+    for j = 1:laser_n
+        idx = (j - 1) * pixel_n + (1:pixel_n);
+        measure_array(idx) = measurements_tmp(:, j);
     end
-    mua_grd_temp(mua_grd_temp<0)=0;
-    SubPlotMap(mua_grd_temp,'GT',nfig,Nr,Nc,1,res_fact);
-    colormap('hot')
-    set(gca, 'FontSize', 16);
 
-    
-    nfig =2;
-    Nr = 1;Nc = 1;
-    res_fact = [1,1,1];
-    mua_grd =attn_pred;
-    mua_grd_temp = mua_grd;
-    for j = 1:size(mua_grd,3)
-        mua_grd_temp(:,:,j) = flip(mua_grd(:,:,j)',2);
+    measure_array = measure_array(mask);
+    bn = double(measure_array(:));
+
+    thr = 1e-4;
+    tau = 1e-5;
+    maxit_array = 50;
+
+    for maxit = maxit_array
+        regpar = 'wgcv';
+        alpha_c = 0.01;
+
+        trunc_options.nOuter = 1;
+        trunc_options.nInner = maxit;
+        trunc_options.max_mm = 200;
+        trunc_options.compress = 'SVD';
+
+        input = HyBRset( ...
+            'InSolv', 'Tikhonov', ...
+            'x_true', gt(:), ...
+            'Iter', trunc_options.nInner, ...
+            'RegPar', regpar);
+
+        trunc_mats = [];
+
+        [x_HyBR_non, HyBR_output_non, trunc_mats] = ...
+            HyBRrecycle_l1_2( ...
+                weighting_Matrix, bn, recon_grd, thr, tau, alpha_c, ...
+                [], input, trunc_options, trunc_mats);
+
+        trunc_mats.Y = [];
+        trunc_mats.R = [];
+        trunc_mats.x = [];
+        trunc_mats.W = double(pred(:) / norm(pred(:)));
+
+        input = HyBRset( ...
+            'InSolv', 'Tikhonov', ...
+            'x_true', gt(:), ...
+            'Iter', trunc_options.nInner, ...
+            'RegPar', regpar);
+
+        [x_HyBR, HyBR_output, trunc_mats] = ...
+            HyBRrecycle_l1_2( ...
+                weighting_Matrix, bn, recon_grd, thr, tau, alpha_c, ...
+                [], input, trunc_options, trunc_mats);
+
+        HyBR_E_nor_non = HyBR_output_non.E_nor;
+        HyBR_E_nor = HyBR_output.E_nor;
+
+        pred(pred < 0) = 0;
+
+        pred_error_Enor = norm( ...
+            gt(:) / max(gt(:)) - ...
+            (pred(:) - min(pred(:))) / ...
+            (max(pred(:)) - min(pred(:)))) ...
+            / norm(gt(:) / max(gt(:)));
+
+
+        HyBR_E_nor = [pred_error_Enor; HyBR_E_nor];
+
+        fprintf('Prediction error (E_nor): %.16f\n', pred_error_Enor);
+        fprintf('WB-IPM error (E_nor) at %d iterations: %.16f\n', ...
+            maxit, HyBR_E_nor(end));
+
+        x_HyBR_non = reshape(x_HyBR_non, recon_grd);
+        x_HyBR = reshape(x_HyBR, recon_grd);
+
+        Nr = 1;
+        Nc = 1;
+        res_fact = [1, 1, 1];
+
+        nfig = 99;
+        mua_grd = gt;
+        mua_grd_temp = mua_grd;
+
+        for j = 1:size(mua_grd, 3)
+            mua_grd_temp(:, :, j) = flip(mua_grd(:, :, j)', 2);
+        end
+
+        mua_grd_temp(mua_grd_temp < 0) = 0;
+        SubPlotMap(mua_grd_temp, 'GT', nfig, Nr, Nc, 1, res_fact);
+        colormap('hot');
+
+        nfig = 100;
+        mua_grd = pred;
+        mua_grd_temp = mua_grd;
+
+        for j = 1:size(mua_grd, 3)
+            mua_grd_temp(:, :, j) = flip(mua_grd(:, :, j)', 2);
+        end
+
+        mua_grd_temp(mua_grd_temp < 0) = 0;
+        SubPlotMap(mua_grd_temp, 'Prediction', nfig, Nr, Nc, 1, res_fact);
+        colormap('hot');
+
+        nfig = 101;
+        x_HyBR_non_neg = x_HyBR_non;
+        x_HyBR_non_neg(x_HyBR_non_neg < 0) = 0;
+        x_HyBR_non_norm = ...
+            (x_HyBR_non_neg - min(x_HyBR_non_neg(:))) / ...
+            (max(x_HyBR_non_neg(:)) - min(x_HyBR_non_neg(:)));
+
+        mua_grd = x_HyBR_non_norm;
+        mua_grd_temp = mua_grd;
+
+        for j = 1:size(mua_grd, 3)
+            mua_grd_temp(:, :, j) = flip(mua_grd(:, :, j)', 2);
+        end
+
+        mua_grd_temp(mua_grd_temp < 0) = 0;
+        SubPlotMap(mua_grd_temp, 'HyBR(non)', nfig, Nr, Nc, 1, res_fact);
+        colormap('hot');
+
+        nfig = 102;
+        x_HyBR_neg = x_HyBR;
+        x_HyBR_neg(x_HyBR_neg < 0) = 0;
+        x_HyBR_norm = ...
+            (x_HyBR_neg - min(x_HyBR_neg(:))) / ...
+            (max(x_HyBR_neg(:)) - min(x_HyBR_neg(:)));
+
+        mua_grd = x_HyBR_norm;
+        mua_grd_temp = mua_grd;
+
+        for j = 1:size(mua_grd, 3)
+            mua_grd_temp(:, :, j) = flip(mua_grd(:, :, j)', 2);
+        end
+
+        mua_grd_temp(mua_grd_temp < 0) = 0;
+        SubPlotMap(mua_grd_temp, 'HyBR', nfig, Nr, Nc, 1, res_fact);
+        colormap('hot');
+
+        figure(2);
+        plot(HyBR_E_nor_non(1:end-1), ...
+            'Color', 'blue', 'LineWidth', 2);
+        hold on;
+        plot(HyBR_E_nor(1:end-1), ...
+            'Color', 'red', 'LineWidth', 2);
+        legend('HyBR(non)', 'HyBR', 'FontSize', 15);
+        xlabel('Iterations', 'FontSize', 15);
+        ylabel('Relative error', 'FontSize', 15);
+        hold off;
     end
-    mua_grd_temp(mua_grd_temp<0)=0;
-    SubPlotMap(mua_grd_temp,'Attention U-Net',nfig,Nr,Nc,1,res_fact);
-    colormap('hot')     
-    set(gca, 'FontSize', 16);
-
-trunc_options.nInner = maxit;
-trunc_mats = [];
-input = HyBRset('InSolv', 'Tikhonov', 'x_true', gt(:),'Iter', trunc_options.nInner,'RegPar','wgcv');
-
-[x_fHybr,fHybr_info] = WB_Projection(weighting_Matrix, bn,recon_grd,thr,tau,[],input, trunc_options, trunc_mats);
-x_fHybr = reshape(x_fHybr,recon_grd);
-x_fHybr(x_fHybr<0)  = 0;
-nfig =111;
-Nr = 1;Nc = 1;
-res_fact = [1,1,1];
-mua_grd =x_fHybr;
-mua_grd_temp = mua_grd;
-for j = 1:size(mua_grd,3)
-    mua_grd_temp(:,:,j) = flip(mua_grd(:,:,j)',2);
-end
-mua_grd_temp(mua_grd_temp<0)=0;
-SubPlotMap(mua_grd_temp,'fHybr',nfig,Nr,Nc,1,res_fact);
-colormap('hot')     
-set(gca, 'FontSize', 16);
-
-%% WB-IPM
-trunc_mats.Y = [];
-trunc_mats.R = [];
-trunc_mats.x = [];
-trunc_options.nInner = maxit;
-trunc_mats.W = [double(attn_pred(:)/(norm(attn_pred(:))))];
-
-input = HyBRset('InSolv', 'Tikhonov', 'x_true', gt(:),'Iter', trunc_options.nInner,'RegPar','wgcv');
-
-[x_WBIPM, WBIPM_info] = WB_Projection(weighting_Matrix, bn,recon_grd,thr,tau,[],input, trunc_options, trunc_mats);
-x_WBIPM = reshape(x_WBIPM,recon_grd);
-x_WBIPM(x_WBIPM<0)=0;
-     
-attn_pred = (attn_pred-min(attn_pred(:)))./ (max(attn_pred(:))-min(attn_pred(:)));
-pred_rela_err = norm(attn_pred(:)-gt(:))/norm(gt(:));
-%  
-nfig =112;
-Nr = 1;Nc = 1;
-res_fact = [1,1,1];
-x_WBIPM = reshape(x_WBIPM,size(gt));
-x_WBIPM = (x_WBIPM-min(x_WBIPM(:)))/(max(x_WBIPM(:))-min(x_WBIPM(:)));
-mua_grd = x_WBIPM;
-mua_grd_temp = mua_grd;
-for j = 1:size(mua_grd,3)
-mua_grd_temp(:,:,j) = flip(mua_grd(:,:,j)',2);
-end
-mua_grd_temp(mua_grd_temp<0)=0;
-% mua_grd_temp = mua_grd_temp-min(mua_grd_temp(:));
-SubPlotMap(mua_grd_temp,'WB-IPM',nfig,Nr,Nc,1,res_fact);
-colormap('hot')
-%%
-figure(200)
-hold on
-semilogy(fHybr_info.E_nor, '-.*', 'Color', [0 0 1], 'LineWidth', 3);
-semilogy([pred_rela_err;WBIPM_info.E_nor], '-.*', 'Color', [1 0 0], 'LineWidth', 3);
-hold off
-legend('fHybr','WB-IPM','Fontsize',18);
-xlabel('Iterations','Fontsize',18);
-ylabel('Relative error','Fontsize',18);
-set(gca,'FontName','Times New Roman','FontSize',18,'LineWidth',1);
 end
