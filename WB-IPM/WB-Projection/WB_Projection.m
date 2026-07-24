@@ -1,8 +1,8 @@
-function [x_out, output, trunc_mats] = WB_Projection(A, b,nvec,thr,tau, P, options, trunc_options, trunc_mats)
+function [x_out, output, trunc_mats] = WB_projection(A, b, nvec, thr, tau, regpar_c, P, options, trunc_options, trunc_mats)
 %
-% [x_out, output, trunc_mats] = WB_Projection(A, b,nvec,thr,tau, P, options, trunc_options, trunc_mats)
+% [x_out, output, trunc_mats] = WB_projection(A, b, nvec, thr, tau, regpar_c, P, options, trunc_options, trunc_mats)
 %
-% WB_Projection is a Golub-Kahan-based hybrid projection methods that can
+% WB_projection is a Golub-Kahan-based warm-basis hybrid projection method that can
 % exploit compression and recycling techniques in order to solve a broad
 % class of inverse problems where memory requirements or high computational
 % cost may otherwise be prohibitive.
@@ -12,9 +12,9 @@ function [x_out, output, trunc_mats] = WB_Projection(A, b,nvec,thr,tau, P, optio
 %                           (b) a matrix object that performs matrix*vector
 %                                 and matrix'*vector operations
 %                b : rhs vector
-%                nvec : grid dimension
-%                thr : threshold used for generating L for l1
-%                tau : small 
+%         regpar_c : user-specified nonnegative regularization parameter
+%                    for the warm-basis coefficient. WGCV is not used
+%                    for this scalar subproblem.
 %                P : left preconditioner, P_left, OR
 %                  : cell containing left and right preconditioner (optional)
 %                          {P_left, P_right}
@@ -46,6 +46,12 @@ function [x_out, output, trunc_mats] = WB_Projection(A, b,nvec,thr,tau, P, optio
 %         ResTol - Residual tolerance for stopping the LBD iterations,
 %                    similar to the stopping criteria from [1]: [atol, btol]
 %                   [non-negative scalar  | {[10^-6, 10^-6]}]
+%       StopRule - iteration stopping rule: 'maxit', 'gcv', 'dp',
+%                  'gcv_dp', or 'all'. Default is 'gcv_dp'.
+%                  options.Iter is always enforced as the maximum.
+%       NoiseLevel - noise level for discrepancy principle. If <1, it is
+%                    treated as relative noise level; otherwise absolute.
+%       DPTau - safety factor for discrepancy principle, default 1.01.
 %       Note: options is a structure created using the function 'HyBRset'
 %               (see 'HyBRset' for more details)
 %
@@ -70,8 +76,6 @@ function [x_out, output, trunc_mats] = WB_Projection(A, b,nvec,thr,tau, P, optio
 %      iterations - stopping iteration (options.Iter | GCV-determined)
 %         GCVstop - GCV curve used to find stopping iteration
 %            Enrm - relative error norms (requires x_true)
-%            E_nor - relative error norms computed after 0-1 normalizaton 
-%                     (requires x_true)
 %            Rnrm - relative residual norms
 %            Xnrm - relative solution norms
 %             U,V - Lanczos basis vectors
@@ -81,11 +85,9 @@ function [x_out, output, trunc_mats] = WB_Projection(A, b,nvec,thr,tau, P, optio
 %                       2 - min of GCV curve (within window of MinTol its)
 %                       3 - performed max number of iterations
 %                       4 - achieved residual tolerance
+%                       5 - discrepancy principle
 %           alpha - regularization parameter at (output.iterations) its
-%           Alpha - vector of all regularization parameters computed for
-%           the augment space (compute z)
-%           Alpha_c - vector of all regularization parameters computed for 
-%                     the NN output basis space (compute c)
+%           Alpha - vector of all regularization parameters computed
 %     truncmats : structure containing recycled matrices, W, Y, R, and x
 %
 % References:
@@ -95,30 +97,42 @@ function [x_out, output, trunc_mats] = WB_Projection(A, b,nvec,thr,tau, P, optio
 %           Recycling for Inverse Problems". SISC, 2020.
 %
 % J. Chung, E. de Sturler, and J. Jiang, 2020
-
+ 
 %% Initialization
+% Added optional stopping controls through the options structure.
 defaultopt = struct('InSolv','tikhonov','RegPar','wgcv','Omega',...
   'adapt', 'Iter', [], 'Reorth','off','x_true', 'off', 'BegReg', 2,...
-  'Vx' , [], 'FlatTol', 10^-6, 'MinTol', 4, 'ResTol', [10^-6, 10^-6]);
-
+  'Vx' , [], 'FlatTol', 10^-6, 'MinTol', 4, 'ResTol', [10^-6, 10^-6],...
+  'StopRule', 'gcv_dp', 'NoiseLevel', [], 'DPTau', 1.01);
+ 
 % If input is 'defaults,' return the default options in x_out
 if nargin==1 && nargout <= 1 && isequal(A,'defaults')
   x_out = defaultopt;
   return;
 end
-
-% Check for acceptable number of input arguments
-if nargin < 2
-  error('HyBR: Not Enough Inputs')
-elseif nargin < 3
-  P = {[],[]}; options = []; trunc_options = [];
-elseif nargin < 4
-  options = []; trunc_options = [];
+ 
+% Check required inputs and optional arguments.
+if nargin < 6
+  error('WB_projection:NotEnoughInputs', ...
+    'A, b, nvec, thr, tau, and regpar_c are required.');
 end
-if isempty(options)
+if isempty(regpar_c) || ~isscalar(regpar_c) || ~isnumeric(regpar_c) || regpar_c < 0
+  error('WB_projection:InvalidRegParC', ...
+    'regpar_c must be a user-specified nonnegative scalar.');
+end
+if nargin < 7 || isempty(P)
+  P = {[], []};
+end
+if nargin < 8 || isempty(options)
   options = defaultopt;
 end
-
+if nargin < 9
+  trunc_options = [];
+end
+if nargin < 10
+  trunc_mats = [];
+end
+ 
 if isempty(trunc_options) % Additional parameters for truncation
   nOuter = 1;
   nInner = 40;
@@ -126,7 +140,7 @@ else
   nOuter = trunc_options.nOuter;
   nInner = trunc_options.nInner;
 end
-
+ 
 if iscell(P) % Preconditioner
   P_le = P{1};
   P_ri = P{2};
@@ -134,12 +148,12 @@ else
   P_le = P;
   P_ri = [];
 end
-
+ 
 % Get options:
-[m,n] = size(A);
+[m, n] = size(A);
 defaultopt.Iter = min([m, n, 50]);
 options = HyBRset(defaultopt, options);
-
+ 
 solver = HyBRget(options,'InSolv',[],'fast');
 regpar = HyBRget(options,'RegPar',[],'fast');
 omega = HyBRget(options,'Omega',[],'fast');
@@ -149,11 +163,57 @@ regstart = HyBRget(options,'BegReg',[],'fast');
 degflat = HyBRget(options,'FlatTol',[],'fast');
 mintol = HyBRget(options,'MinTol',[],'fast');
 restol = HyBRget(options,'ResTol',[],'fast');
-
-adaptWGCV = strcmp(regpar, {'wgcv'}) && strcmp(omega, {'adapt'});
-
+ 
+% Additional stopping-control options.
+% Do not use HyBRget here because some HyBRget implementations cannot
+% query user-defined fields such as StopRule/NoiseLevel/DPTau.
+if isstruct(options) && isfield(options,'StopRule') && ~isempty(options.StopRule)
+  stoprule = options.StopRule;
+else
+  stoprule = 'gcv_dp';
+end
+ 
+if isstruct(options) && isfield(options,'NoiseLevel')
+  noiselevel = options.NoiseLevel;
+else
+  noiselevel = [];
+end
+ 
+if isstruct(options) && isfield(options,'DPTau') && ~isempty(options.DPTau)
+  dptau = options.DPTau;
+else
+  dptau = 1.01;
+end
+ 
+% Parse stopping rule without changing the function interface.
+% StopRule can be a string, e.g., 'maxit', 'gcv', 'dp', 'gcv_dp', 'all',
+% or a cell array, e.g., {'gcv','dp'}. MaxIter is always enforced by options.Iter.
+if iscell(stoprule)
+  stopstr = '';
+  for ii_stop = 1:numel(stoprule)
+    stopstr = [stopstr '_' lower(stoprule{ii_stop})]; %#ok<AGROW>
+  end
+else
+  stopstr = lower(stoprule);
+end
+useGCVstop = ~isempty(strfind(stopstr,'gcv')) || strcmp(stopstr,'all');
+useDPstop = ~isempty(strfind(stopstr,'dp')) || strcmp(stopstr,'all');
+ 
+% Discrepancy principle threshold. If NoiseLevel < 1, treat it as a
+% relative noise level and use delta = NoiseLevel * ||b||. Otherwise,
+% treat NoiseLevel as an absolute noise norm.
+if isempty(noiselevel)
+  dp_delta = [];
+elseif noiselevel < 1
+  dp_delta = noiselevel * norm(b);
+else
+  dp_delta = noiselevel;
+end
+ 
+adaptWGCV = ischar(regpar) && strcmpi(regpar,'wgcv') && ischar(omega) && strcmpi(omega,'adapt');
+ 
 notrue = isempty(x_true);
-
+ 
 %--------------------------------------------
 %  The following is needed for RestoreTools:
 %
@@ -169,10 +229,7 @@ end
 %
 %  End of new stuff needed for RestoreTools
 %--------------------------------------------
-
-% [Dx, Dy, Dz] = create3DGradientMatrices(nvec(1), nvec(2), nvec(3));
-% D = [Dx; Dy; Dz];
-
+ 
 % Set-up output parameters:
 outputparams = nargout>1;
 if outputparams
@@ -187,15 +244,28 @@ if outputparams
   output.Alpha_c = ones(maxiter,1);
   output.U = [];
   output.V = [];
-%   output.B = [];
   output.T = [];
   output.G = [];
   output.Z = [];
   output.flag = 3;
   output.alpha = 0;
   output.E_opt = ones(maxiter,1);
+  output.StopRule = stoprule;
+  output.StopReason = 'maxit';
+  output.DPthreshold = [];
+  if ~isempty(dp_delta)
+    output.DPthreshold = dptau * dp_delta;
+  end
+ 
+  % Runtime tracking.
+  % CumTime(k) records the elapsed wall-clock time, in seconds, after the
+  % kth projected iteration has produced a reconstruction. IterTime(k)
+  % records the incremental time since the previous recorded iteration.
+  output.CumTime = nan(maxiter,1);
+  output.IterTime = nan(maxiter,1);
+  output.TotalTime = nan;
 end
-
+ 
 % Test for a left preconditioner and define solver:
 if isempty(P_le)
   beta = norm(b);
@@ -209,21 +279,15 @@ else
   beta = norm(U); U = U / beta;
   handle = @PLBD;
 end
-
-switch solver
-  case 'tsvd'
-    solverhandle = @TSVDsolver;
-  case 'tikhonov'
-    solverhandle = @Tikhonovsolver;
-end
-
+ 
+ 
 % check/setup reycling
 if isempty(trunc_mats)
   no_recycle = 1; % build recycling matrices at start
 else
   no_recycle = 0;
   % W and S must be defined; check size
-  if isempty(trunc_mats.W) | size(trunc_mats.W,2) > (nInner-1)
+  if isempty(trunc_mats.W) || size(trunc_mats.W, 2) > (nInner - 1)
     fprintf('trunc_mats.W must exist \n');
     fprintf('number of recycling vectors must be less than max_mm+2 \n\n');
     return
@@ -251,23 +315,33 @@ else
     R = trunc_mats.R;
   end
 end
-
+ 
 %% Main Code Begins Here
-T = []; G =[]; V = []; GCV = []; Omega= []; Z = [];
+runtime_tic = tic;
+last_recorded_time = 0;
+ 
+T = []; G = []; V = []; GCV = []; Omega = []; Z = [];
 terminate = 0;
-if (strcmp(regpar, {'wgcv'}) || strcmp(regpar, {'gcv'}))
+if useGCVstop && ischar(regpar) && (strcmpi(regpar,'wgcv') || strcmpi(regpar,'gcv'))
   terminate = 1;
 end
-warning = 0; iter = 0;
+gcv_warning = 0;
+iter = 0;
 L = ones(size(A,2),1);
-
+ 
+% Incremental QR factors for the correction basis Z.
+% In the WB/recycling branch, alpha is selected from the correction
+% subproblem (G,Z), not from the augmented [W,Z] problem.
+QZ = []; RZ = [];
+ 
 for outer = 1:nOuter
   if no_recycle
     % first run is standard GK with nInner iterations
     for inner = 1:nInner
       iter = iter+1;
       [U,T,G, V, Z] = feval(handle, A, U, T,G, V, Z, L, P_le, P_ri, options,1);
-       [~,Rs] = qr(Z,0);
+       [QZ,RZ] = local_qr_append_col(QZ,RZ,Z(:,end));
+       Rs = RZ;
       if strcmp(regpar,'optimal')
         options.Zx = Z;
       end
@@ -275,10 +349,7 @@ for outer = 1:nOuter
         vector = (beta*eye(size(G,2)+1,1)); % assumes b is first vector in V
         switch solver
           case{'tsvd', 'tikhonov'}% Solve projected problem using TSVD/Tikhonov at each iteration
-%             BR = B / Rs;
-            [Ub, Sb, Vb] = svd(G);
-            Sk = diag(Sb);
-            rhskhat = Ub'* vector;
+            [Ub, Sb, ~] = svd(G);   % full U is needed by WGCV/GCVstopfun
             if adaptWGCV %Use the adaptive, weighted GCV method
                  if iter>1
                 Omega(iter) = min(1, findomega(Ub'* vector,diag(Sb), solver));
@@ -289,30 +360,27 @@ for outer = 1:nOuter
               options.Omega = mean(Omega);
               errhan = @(p)WGCV_l1(p,G,Rs,vector,options.Omega);
                alpha = fminunc(errhan,alpha0);
-                  
-%                 alpha = fminbnd('TikGCV', 0, Sk(1), [], Ub'* vector, Sk, options.Omega);
                
             else
                 alpha = regpar;
             end
-
-%             [y_star, alpha] = feval(solverhandle, Ub, diag(Sb), Vb, vector, options, BR, iter, Z, m);     
             IR = alpha^2*(Rs'*Rs);
             GIR = G'*G + IR;
             C = GIR\G';
             y = C*vector;
+            % Compute the GCV value used to find the stopping criteria
             GCV(iter-1) = GCVstopfun(alpha, Ub(1,:)', diag(Sb), beta, m, n, solver);
             
             % Determine if GCV wants us to stop
             if iter > 2 && terminate
               %%-------- If GCV curve is flat, we stop -----------------------
-              if abs((GCV(iter-1)-GCV(iter-2)))/GCV(regstart-1) < degflat
+              if abs(GCV(iter-1) - GCV(iter-2)) / max(abs(GCV(regstart-1)), eps) < degflat
                 x_out =Z*y; % Return the solution at (i-1)st iteration
                 % Test for a right preconditioner:
                 if ~isempty(P_ri)
                   x_out = P_ri \ x_out;
                 end
-                if notrue %Set all the output parameters and return
+                if notrue || useGCVstop %Set all the output parameters and return
                   if outputparams
                     output.U = U;
                     output.V = V;
@@ -322,10 +390,10 @@ for outer = 1:nOuter
                     output.GCVstop = GCV(:);
                     output.iterations = iter-1;
                     output.flag = 1;
+                    output.StopReason = 'gcv_flat';
                     output.alpha = alpha; % Reg Parameter at the (i-1)st iteration
-%                     output.Alpha = [Alpha;alpha]; % Reg Parameters
                   end
-                  close(h)
+                  if exist('h','var') && ishandle(h), close(h); end
                   %--------------------------------------------
                   %  The following is needed for RestoreTools:
                   %
@@ -340,6 +408,7 @@ for outer = 1:nOuter
                   if outputparams
                     output.iterations = iter-1; % GCV says stop at (i-1)st iteration
                     output.flag = 1;
+                    output.StopReason = 'gcv_flat';
                     output.alpha = alpha; % Reg Parameter at the (i-1)st iteration
                   end
                 end
@@ -347,15 +416,15 @@ for outer = 1:nOuter
                 
                 %%--- Have warning : Avoid bumps in the GCV curve by using a
                 %    window of (mintol+1) iterations --------------------
-              elseif warning && length(GCV) > iterations_save + mintol %Passed window
-                if GCV(iterations_save) < GCV(iterations_save+1:end)
+              elseif gcv_warning && length(GCV) > iterations_save + mintol %Passed window
+                if all(GCV(iterations_save) < GCV(iterations_save+1:end))
                   % We should have stopped at iterations_save.
                   x_out = x_save;
                   % Test for a right preconditioner:
                   if ~isempty(P_ri)
                     x_out = P_ri \ x_out;
                   end
-                  if notrue %Set all the output parameters and return
+                  if notrue || useGCVstop %Set all the output parameters and return
                     if outputparams
                       output.U = U;
                       output.V = V;
@@ -365,10 +434,10 @@ for outer = 1:nOuter
                       output.GCVstop = GCV(:);
                       output.iterations = iterations_save;
                       output.flag = 2;
+                      output.StopReason = 'gcv_min';
                       output.alpha = alpha_save;
-%                       output.Alpha = Alpha(1:iterations_save); % Reg Parameters
                     end
-                    close(h)
+                    if exist('h','var') && ishandle(h), close(h); end
                     %--------------------------------------------
                     %  The following is needed for RestoreTools:
                     %
@@ -383,22 +452,23 @@ for outer = 1:nOuter
                     if outputparams
                       output.iterations = iterations_save;
                       output.flag = 2;
+                      output.StopReason = 'gcv_min';
                       output.alpha = alpha_save;
                     end
                   end
                   terminate = 0; % Solution is already found!
                   
                 else % It was just a bump... keep going
-                  warning = 0;
+                  gcv_warning = 0;
                   x_out = [];
                   iterations_save = maxiter;
                   alpha_save = 0;
                 end
                 
                 %% ----- No warning yet: Check GCV function---------------------
-              elseif ~warning
+              elseif ~gcv_warning
                 if GCV(iter-2) < GCV(iter-1) %Potential minimum reached.
-                  warning = 1;
+                  gcv_warning = 1;
                   % Save data just in case.
                   x_save = Z*y;
                   iterations_save = iter-1;
@@ -410,16 +480,25 @@ for outer = 1:nOuter
           case 'none'
             y = G \ vector;
         end
+ 
+        % Record cumulative and per-iteration runtime after the current
+        % projected solution has been computed.
+        if outputparams
+          current_time = toc(runtime_tic);
+          output.CumTime(iter,1) = current_time;
+          output.IterTime(iter,1) = current_time - last_recorded_time;
+          output.TotalTime = current_time;
+          last_recorded_time = current_time;
+        end
+ 
         ri = vector - G*y;
         ri_nrm = norm(ri);
         Vy = Z*y;
         r_out = b - A*Vy;
         rnrm = norm(r_out);
-    
-        dzj = 2*sqrt(Vy(:).^2+eps);
-        dzj(dzj<thr) = tau;
-%         dxj_3d = reshape(dxj,nvec);
-        L = dzj(:).^(1/2);
+        dxj = 2*sqrt(Vy(:).^2+eps);
+        dxj(dxj<thr) = tau;
+        L = dxj(:).^(1/2);
         
         if outputparams
             temp_Vy = Vy(:);
@@ -428,31 +507,83 @@ for outer = 1:nOuter
             
             temp_true = x_true(:);
             output.E_nor_inne(iter,1) = norm((temp_Vy(:)-min(temp_Vy(:)))/(max(temp_Vy(:))-min(temp_Vy(:)))-temp_true(:)/max(temp_true(:)))/norm(temp_true(:)/max(temp_true(:)));
-
+ 
             temp_Vy = (temp_Vy(:)-min(temp_Vy(:)))/(max(temp_Vy(:))-min(temp_Vy(:)));
              output.E_nor(iter,1) = norm(temp_Vy(:)-temp_true(:))/norm(temp_true(:));
               temp_Vy = reshape(temp_Vy,nvec);
               temp_true = reshape(temp_true,nvec);
               % Assume temp_Vy and temp_true are given 3D matrices of size [55,55,15]
+ 
+% Define slice sizes
+slices = [ceil(nvec(3)/4), ceil(nvec(3)/4), ceil(nvec(3)/4), nvec(3)-ceil(nvec(3)/4)*3];  % Total sum is 15
+num_slices = length(slices);  % Number of partitions
+ 
+% Starting index
+start_idx = 1;
+ 
+for i_slice = 1:num_slices
+    % Define end index for the current slice
+    end_idx = start_idx + slices(i_slice) - 1;
+    
+    % Extract corresponding slices from temp_Vy and temp_true
+    Vy_part = temp_Vy(:,:,start_idx:end_idx);
+    true_part = temp_true(:,:,start_idx:end_idx);
+    
+    % Compute relative error for the current slice
+    error_norm = norm(Vy_part(:) - true_part(:), 2);  % L2 norm of error
+    
+    % Avoid division by zero
+    output.E_nor_slice(iter,i_slice) = error_norm;
+    % Update start index for next slice
+    start_idx = end_idx + 1;
+end
              
             output.Enrm(iter,1) = norm(Vy(:)-x_true(:))/norm(x_true(:));
             x_opt = V*(V\x_true);
             output.E_opt(iter,1) = norm( x_opt(:)-x_true(:) )/norm(x_true(:));
           end
-
+ 
           output.Rnrm(iter,1) = norm(A*temp_Vy(:)/max(temp_Vy(:))-b);
           output.Xnrm(iter,1) = norm(Vy);
           output.Alpha(iter,1) = alpha;
         end
         
+        % Optional discrepancy-principle stopping on the full residual.
+        if useDPstop && ~isempty(dp_delta) && rnrm <= dptau*dp_delta
+          x_out = Vy;
+          if outputparams
+            output.iterations = iter;
+            output.flag = 5;
+            output.StopReason = 'DP';
+            output.alpha = alpha;
+          end
+          return
+        end
+ 
+        % Explicit MaxIter stopping via options.Iter.
+        if iter >= maxiter
+          x_out = Vy;
+          if outputparams
+            output.iterations = iter;
+            output.flag = 3;
+            output.StopReason = 'maxit';
+            output.alpha = alpha;
+          end
+          return
+        end
+ 
         if ri_nrm < restol(1)*beta
            Vy =Z*y; % FIX - already above
           x_out = Vy; % FIX - already above
+          if outputparams
+            output.iterations = iter;
+            output.flag = 4;
+            output.StopReason = 'restol';
+          end
           return
         end
       end
     end
-    
      output.G = G;
       output.T = T;
     output.V = V;
@@ -484,111 +615,101 @@ for outer = 1:nOuter
     zeta = (Y'*r_upd);
     btil = r_upd - Y*zeta;
     betaInn = norm(btil); U = btil/betaInn;
-    G = []; T = []; V = []; H = []; GCV = []; Omega= []; Z=[];
-    handle = @recyclingFGK_l1; %% recyclingGKB process
+    G = []; T = []; V = []; H = []; GCV = []; Omega = []; Z = [];
+    handle = @recyclingFGK_l1_2; %% recyclingGKB process
+    
+    % Restart incremental QR factors for the correction basis in this
+    % recycling/WB cycle. We do not maintain QR([W,Z]) because the
+    % alternating WB-IPM treats the warm-basis coefficient and correction
+    % subproblems separately.
+    QZ = []; RZ = [];
     
     for inner = 1:nInner-kk
       iter = iter+1;
       [U, T,G, V, H,Z] = feval(handle, A, U, T,G, V, H,Z,L, P_le, P_ri, W, Y, options);
       
-      [~,Rs] = qr([W Z],0);
+      [QZ,RZ] = local_qr_append_col(QZ,RZ,Z(:,end));
+      Rs0 = RZ;
       if strcmp(regpar,'optimal')
-        options.Vx = [W Z];
+        options.Vx = Z;
       end
+ 
       mm = inner;
-      BB = zeros(kk+mm+1,kk+mm); % we could extend BB rather then compute from scratch
+ 
+      % Split the augmented right-hand side according to the alternating
+      % WB-IPM formulation. The correction regularization parameter is
+      % selected from the Z-subproblem only.
+      vector_c = zeta;
+      vector_z = (betaInn*eye(size(G,2)+1,1)); % betaInn*e1
+ 
+      % Keep BB/vector only for diagnostics, optional GCV stopping output,
+      % the no-regularization fallback, and the compression step. They are
+      % no longer used for WGCV parameter selection.
+      BB = zeros(kk+mm+1,kk+mm);
       BB(1:kk,1:kk) = R;
       BB(1:kk,kk+1:kk+mm) = H;
       BB(kk+1:kk+mm+1,kk+1:kk+mm) = G;
       vector = zeros(mm+kk+1,1);
-      vector(1:kk) = zeta + R(:,end);
-      vector(kk+1:kk+mm+1) = (betaInn*eye(size(G,2)+1,1)); % assumes normalized btil is first vector in U
-%       BR = BB / Rs;
-      [Ub,Sb,Vb] = svd(BB);
-%       Sb =diag(Sb);
-%       rhskhat = Ub'*vector;
+      vector(1:kk) = vector_c;
+      vector(kk+1:kk+mm+1) = vector_z;
+ 
       y = zeros(kk+mm,1);
       switch solver
-        case{'tsvd', 'tikhonov'}% Solve projected problem using TSVD/Tikhonov at each iteration
-          if mm+kk == 1
-            Sb = Sb(1,1);
-            
-            if adaptWGCV %Use the adaptive, weighted GCV method
-              if iter > 1
-                Omega(iter-1) = min(1, findomega(Ub'* vector,diag(Sb), solver));
-              else
-                Omega(1) = 1;
-              end
-              options.Omega = mean(Omega);
-            end
-            
-%             y = feval(solverhandle, Ub, Sb, Vb, vector, options, G, iter, [Z],m);
-                     
-          else           
-            
-            if adaptWGCV %Use the adaptive, weighted GCV method
-              if iter>1
-                Omega(iter-1) = min(1, findomega(Ub'* vector,diag(Sb), solver));
-%                Omega(iter-1) = min(1, findomega(rhskhat, diag(Sb),solver));
-              else
-                Omega(1) = 1;
-              end
-               alpha0 = -0.5;     
-               
-              options.Omega = mean(Omega);
-              errhan = @(p)WGCV_l1(p,BB,Rs,vector,options.Omega);
-               alpha = fminunc(errhan,alpha0);
-%                 alpha = fminbnd('TikGCV', 0, Sb(1), [], rhskhat, diag(Sb), options.Omega);
-               
+        case{'tsvd', 'tikhonov'} % Solve the correction subproblem in Z
+          [Ub,Sb,~] = svd(G);   % full U is needed by WGCV/GCVstopfun
+ 
+          if adaptWGCV
+            if iter > 1
+              Omega(iter-1) = min(1, findomega(Ub'*vector_z,diag(Sb),solver));
             else
-                 alpha = regpar;
+              Omega(1) = 1;
             end
-
-              [~,Rs0] = qr([Z],0);
-             IR0 = alpha^2*(Rs0'*Rs0);
-             GIR = G'*G + IR0;
-            C = GIR\G';
-            y(kk+1:kk+mm) = C*vector(kk+1:kk+mm+1); 
-            c_right = vector(1:kk)-H* y(kk+1:kk+mm);
-            if adaptWGCV %Use the adaptive, weighted GCV method
-              if iter>1
-                Omega_c(iter-1) = min(1, findomega(c_right,diag(R), solver));
-%                Omega(iter-1) = min(1, findomega(rhskhat, diag(Sb),solver));
-              else
-                Omega_c(1) = 1;
-              end
-               alpha0 = -0.5;     
-               
-              omega_c = mean(Omega_c);
-%               errhan = @(p)WGCV_l1(p,BB,Rs,vector,options.Omega);
-%                alpha = fminunc(errhan,alpha0);
-                alpha_c = fminbnd('TikGCV', 0, abs(R(1)), [], c_right,abs(R),omega_c);
-               
-            else
-%                  alpha_c = regpar_c;
-            end
-%             alpha_c =regpar_c;
-            y(1:kk) = R*c_right/(R^2+alpha_c^2);
-            
-%             [y_star, alpha] = feval(solverhandle, Ub, diag(Sb), Vb, vector, options, BB, iter, [W,Z],m);
-%             y = Rs \ y_star;
+            alpha0 = -0.5;
+            options.Omega = mean(Omega);
+            errhan = @(p)WGCV_l1(p,G,Rs0,vector_z,options.Omega);
+            alpha = fminunc(errhan,alpha0);
+          else
+            alpha = regpar;
           end
-          output.Alpha(iter) = alpha;
-          output.Alpha_c(iter) = alpha_c;
-          % Compute the GCV value used to find the stopping criteria
+ 
+          % Correction solve:
+          %   min_d ||G*d - vector_z||^2 + alpha^2 ||RZ*d||^2.
+          IR0 = alpha^2*(Rs0'*Rs0);
+          GIR = G'*G + IR0;
+          d = GIR\(G'*vector_z);
+          y(kk+1:kk+mm) = d;
+ 
+          % Warm-basis coefficient update. The user-specified regpar_c is
+          % used directly; WGCV is reserved for the correction subproblem.
+          c_right = vector_c - H*d;
+          alpha_c = regpar_c;
+ 
+          if kk == 1
+            y(1:kk) = R*c_right/(R^2 + alpha_c^2);
+          else
+            y(1:kk) = (R'*R + alpha_c^2*eye(kk)) \ (R'*c_right);
+          end
+ 
+          if outputparams
+            output.Alpha(iter) = alpha;
+            output.Alpha_c(iter) = alpha_c;
+          end
+          % Compute the GCV value used to find the stopping criteria.
+          % Since alpha is selected for the correction subproblem, betaInn
+          % is the corresponding right-hand-side norm.
           if iter > 1
-            GCV(iter-1) = GCVstopfun(alpha, Ub(1,:)', diag(Sb), beta, m, n, solver);
+            GCV(iter-1) = GCVstopfun(alpha, Ub(1,:)', diag(Sb), betaInn, m, n, solver);
           end
           % Determine if GCV wants us to stop
           if iter > 2 && terminate
             %%-------- If GCV curve is flat, we stop -----------------------
-            if abs((GCV(iter-1)-GCV(iter-2)))/GCV(regstart-1) < degflat
+            if abs(GCV(iter-1) - GCV(iter-2)) / max(abs(GCV(regstart-1)), eps) < degflat
               x_out = [W,Z]*y; % Return the solution at (i-1)st iteration
               % Test for a right preconditioner:
               if ~isempty(P_ri)
                 x_out = P_ri \ x_out;
               end
-              if notrue %Set all the output parameters and return
+              if notrue || useGCVstop %Set all the output parameters and return
                 if outputparams
                   output.U = [Y,U];
                   output.V = [W,V];
@@ -597,10 +718,10 @@ for outer = 1:nOuter
                   output.GCVstop = GCV(:);
                   output.iterations = iter-1;
                   output.flag = 1;
+                  output.StopReason = 'gcv_flat';
                   output.alpha = alpha; % Reg Parameter at the (i-1)st iteration
-%                   output.Alpha = Alpha(1:iter-1); % Reg Parameters
                 end
-                close(h)
+                if exist('h','var') && ishandle(h), close(h); end
                 %--------------------------------------------
                 %  The following is needed for RestoreTools:
                 %
@@ -615,6 +736,7 @@ for outer = 1:nOuter
                 if outputparams
                   output.iterations = iter-1; % GCV says stop at (i-1)st iteration
                   output.flag = 1;
+                  output.StopReason = 'gcv_flat';
                   output.alpha = alpha; % Reg Parameter at the (i-1)st iteration
                 end
               end
@@ -622,15 +744,15 @@ for outer = 1:nOuter
               
               %%--- Have warning : Avoid bumps in the GCV curve by using a
               %    window of (mintol+1) iterations --------------------
-            elseif warning && length(GCV) > iterations_save + mintol %Passed window
-              if GCV(iterations_save) < GCV(iterations_save+1:end)
+            elseif gcv_warning && length(GCV) > iterations_save + mintol %Passed window
+              if all(GCV(iterations_save) < GCV(iterations_save+1:end))
                 % We should have stopped at iterations_save.
                 x_out = x_save;
                 % Test for a right preconditioner:
                 if ~isempty(P_ri)
                   x_out = P_ri \ x_out;
                 end
-                if notrue %Set all the output parameters and return
+                if notrue || useGCVstop %Set all the output parameters and return
                   if outputparams
                     output.U = [Y,U];
                     output.V = [W,V];
@@ -639,10 +761,10 @@ for outer = 1:nOuter
                     output.GCVstop = GCV(:);
                     output.iterations = iterations_save;
                     output.flag = 2;
+                    output.StopReason = 'gcv_min';
                     output.alpha = alpha_save;
-%                     output.Alpha = Alpha(1:iterations_save); % Reg Parameters
                   end
-                  close(h)
+                  if exist('h','var') && ishandle(h), close(h); end
                   %--------------------------------------------
                   %  The following is needed for RestoreTools:
                   %
@@ -657,21 +779,22 @@ for outer = 1:nOuter
                   if outputparams
                     output.iterations = iterations_save;
                     output.flag = 2;
+                    output.StopReason = 'gcv_min';
                     output.alpha = alpha_save;
                   end
                 end
                 terminate = 0; % Solution is already found!
                 
               else % It was just a bump... keep going
-                warning = 0;
+                gcv_warning = 0;
                 iterations_save = maxiter;
                 alpha_save = 0;
               end
               
               %% ----- No warning yet: Check GCV function---------------------
-            elseif ~warning
+            elseif ~gcv_warning
               if GCV(iter-2) < GCV(iter-1) %Potential minimum reached.
-                warning = 1;
+                gcv_warning = 1;
                 % Save data just in case.
                 x_save = [W,Z]*y;
                 iterations_save = iter-1;
@@ -679,10 +802,19 @@ for outer = 1:nOuter
               end
             end
           end
-        case 'none' % Solve projected problem with no regularization
+        case 'none' % Solve projected augmented problem with no regularization
           y = BB \ vector;
+      end      
+            % Record cumulative and per-iteration runtime after the current
+      % projected solution has been computed.
+      if outputparams
+        current_time = toc(runtime_tic);
+        output.CumTime(iter,1) = current_time;
+        output.IterTime(iter,1) = current_time - last_recorded_time;
+        output.TotalTime = current_time;
+        last_recorded_time = current_time;
       end
-      
+ 
       x1 = y(1:kk); x2 = y(kk+1:mm+kk); % x1 = chat and x2 = d in notes
       ri = vector - BB*y;
       ri_nrm = norm(ri);      
@@ -695,31 +827,52 @@ for outer = 1:nOuter
         c = x1;
         d = x2;
       end
-
+ 
       x_out = W*c + Z*d; % x_out is the adding vector
      z_out = Z*d;
       r_out = b - A*x_out;
       rnrm = norm(r_out);
-
-        dzj = 2*sqrt(z_out(:).^2+eps);
-        dzj(dzj<thr) = tau;
-        L = dzj(:).^(1/2);
-        
-        if outputparams && iter > 1
+        dxj = 2*sqrt(z_out(:).^2+eps);
+        dxj(dxj<thr) = tau;
+        L = dxj(:).^(1/2);
+            if outputparams && iter > 1
            temp_out = x_out(:);
            temp_out(temp_out<0) = 0;
         if ~notrue
+             
             
              temp_Vy = temp_out;
               temp_true = x_true(:);
               output.E_nor_inne(iter-1,1) = norm((temp_Vy(:)-min(temp_Vy(:)))/(max(temp_Vy(:))-min(temp_Vy(:)))-temp_true(:)/max(temp_true(:)))/norm(temp_true(:)/max(temp_true(:)));
-           
-%              output.E_nor(iter-1,1) = norm(temp_out(:)/max(temp_out(:))-temp_true(:)/max(temp_true(:)))/norm(temp_true(:)/max(temp_true(:)));
             temp_Vy = (temp_Vy(:)-min(temp_Vy(:)))/(max(temp_Vy(:))-min(temp_Vy(:)));
              temp_Vy = reshape(temp_Vy,nvec);
               temp_true = reshape(temp_true,nvec);
               % Assume temp_Vy and temp_true are given 3D matrices of size [55,55,15]
-
+ 
+% Define slice sizes
+slices = [ceil(nvec(3)/4), ceil(nvec(3)/4), ceil(nvec(3)/4), nvec(3)-ceil(nvec(3)/4)*3];  % Total sum is 15
+num_slices = length(slices);  % Number of partitions
+ 
+% Starting index
+start_idx = 1;
+ 
+for i_slice = 1:num_slices
+    % Define end index for the current slice
+    end_idx = start_idx + slices(i_slice) - 1;
+    
+    % Extract corresponding slices from temp_Vy and temp_true
+    Vy_part = temp_Vy(:,:,start_idx:end_idx);
+    true_part = temp_true(:,:,start_idx:end_idx);
+    
+    % Compute relative error for the current slice
+    error_norm = norm(Vy_part(:) - true_part(:), 2);  % L2 norm of error
+    
+    % Avoid division by zero
+ 
+    output.E_nor_slice(iter,i_slice) = error_norm;
+    % Update start index for next slice
+    start_idx = end_idx + 1;
+end
              output.E_nor(iter-1,1) = norm(temp_Vy(:)-temp_true(:))/norm(temp_true(:));
           output.Enrm(iter-1,1) = norm(x_out(:)-x_true(:))/norm(x_true(:));
           % projection of x_true onto solution space
@@ -730,11 +883,43 @@ for outer = 1:nOuter
         output.Xnrm(iter-1,1) = norm(x_out);
       end
       
+      % Optional discrepancy-principle stopping on the full residual.
+      if useDPstop && ~isempty(dp_delta) && rnrm <= dptau*dp_delta
+        trunc_mats.W = W;
+        trunc_mats.R = R;
+        trunc_mats.Y = Y;
+        if outputparams
+          output.iterations = iter;
+          output.flag = 5;
+          output.StopReason = 'DP';
+          output.alpha = alpha;
+        end
+        return
+      end
+ 
+      % Explicit MaxIter stopping via options.Iter.
+      if iter >= maxiter
+        trunc_mats.W = W;
+        trunc_mats.R = R;
+        trunc_mats.Y = Y;
+        if outputparams
+          output.iterations = iter;
+          output.flag = 3;
+          output.StopReason = 'maxit';
+          output.alpha = alpha;
+        end
+        return
+      end
+ 
       if ri_nrm < restol(1)*beta
         trunc_mats.W = W;
         trunc_mats.R = R;
         trunc_mats.Y = Y;
-        output.iterations = iter;
+        if outputparams
+          output.iterations = iter;
+          output.flag = 4;
+          output.StopReason = 'restol';
+        end
         return
       end
       
@@ -754,27 +939,74 @@ for outer = 1:nOuter
       d = x2;
     end
     x_out = W*c + Z*d;
+    x_out(x_out<0)=0;
     WV = [W Z];
     %%%%%%%%%%%%%% Perform Compression %%%%%%%%%%%%%%%%%%%
     [kk,W,Y,R] = compression(A,BB,WV,trunc_options,x_out,vector,y,W);
   end
   
 end
-
+ 
 trunc_mats.W = W;
 trunc_mats.R = R;
 trunc_mats.Y = Y;
 output.iterations = iter;
-
+ 
 output.Enrm = output.Enrm(1:iter-1);
 output.E_nor = output.E_nor(1:iter-1);
 output.E_nor_inne = output.E_nor_inne(1:iter-1);
-
+ 
 output.E_opt = output.E_opt(1:iter-1);
 output.Rnrm = output.Rnrm(1:iter-1);
 output.Xnrm = output.Xnrm(1:iter-1);
+output.Alpha = output.Alpha(1:iter-1);
+output.Alpha_c = output.Alpha_c(1:iter-1);
+if isfield(output,'CumTime')
+  output.CumTime = output.CumTime(1:iter);
+  output.IterTime = output.IterTime(1:iter);
+  if iter > 0 && ~isempty(output.CumTime)
+    output.TotalTime = output.CumTime(iter);
+  end
 end
-
+end
+ 
+% -----------------------SUBFUNCTION---------------------------------------
+function [Qnew,Rnew] = local_qr_append_col(Q,R,z)
+%LOCAL_QR_APPEND_COL  Incremental thin-QR update after appending one column.
+% Given an existing thin QR factorization A = Q*R, return the factorization
+% of [A z].  This avoids recomputing qr([A z],0) at every iteration.
+% A second modified Gram-Schmidt pass is used for numerical stability.
+if isempty(Q)
+  r = norm(z);
+  if r <= 10*eps*max(1,norm(z))
+    Qnew = zeros(size(z));
+    Rnew = 0;
+  else
+    Qnew = z/r;
+    Rnew = r;
+  end
+  return;
+end
+ 
+h = Q'*z;
+v = z - Q*h;
+% second pass for stability
+h2 = Q'*v;
+h = h + h2;
+v = v - Q*h2;
+r = norm(v);
+ 
+if r <= 10*eps*max(1,norm(z))
+  % Rare near-breakdown fallback: recover the original matrix and call full QR.
+  % This preserves robustness without changing the algorithmic logic.
+  [Qnew,Rnew] = qr([Q*R z],0);
+else
+  q = v/r;
+  Qnew = [Q q];
+  Rnew = [R h; zeros(1,size(R,2)) r];
+end
+end
+ 
 % -----------------------SUBFUNCTION---------------------------------------
 function omega = findomega(bhat, s, insolv)
 %
@@ -791,12 +1023,12 @@ function omega = findomega(bhat, s, insolv)
 %         insolv -  inner solver method for HyBR
 %
 %  Output:     omega - computed value for the omega parameter.
-
+ 
 %
 %   First assume the 'optimal' regularization parameter to be the smallest
 %   singular value.
 %
-
+ 
 %
 % Compute the needed elements for the function.
 %
@@ -834,7 +1066,7 @@ switch insolv
     error('Unknown solver');
 end
 end
-
+ 
 %% ---------------SUBFUNCTION ---------------------------------------
 function G = GCVstopfun(alpha, u, s, beta, m, n, insolv)
 %
@@ -850,10 +1082,10 @@ function G = GCVstopfun(alpha, u, s, beta, m, n, insolv)
 %     m,n - size of the ORIGINAL problem (matrix A)
 %  insolv - solver for the projected problem
 %
-
+ 
 k = length(s);
 beta2 = beta^2;
-
+ 
 switch insolv
   case 'tsvd'
     t2 = (abs(u(alpha+1:k+1))).^2;
@@ -873,31 +1105,5 @@ switch insolv
   otherwise
     error('Unknown solver');
 end
-end
-
-%%
-function D = createDiffOp(n, m, p)
-    % Create a 1D difference operator for dimension n
-    e = ones(n,1);
-    D = spdiags([-e e], 0:1, n-1, n);
-    % Extend to 3D by taking Kronecker products with identity matrices
-    I_m = speye(m);
-    I_p = speye(p);
-    D = kron(I_p, kron(I_m, D));
-end
-
-function [Dx, Dy, Dz] = create3DGradientMatrices(nx, ny, nz)
-    % Create difference operators for each dimension
-    Dx = createDiffOp(nx, ny, nz);
-    Dy = createDiffOp(ny, nx, nz);
-    Dz = createDiffOp(nz, ny, nx);
-
-    % Adjust Dy and Dz to match their dimensions correctly
-    Dy = reshape(permute(reshape(full(Dy), [ny-1, nx, nz]), [2, 1, 3]), [(ny-1)*nx*nz, ny*nx*nz]);
-    Dz = reshape(permute(reshape(full(Dz), [nz-1, ny, nx]), [3, 2, 1]), [(nz-1)*ny*nx, nz*ny*nx]);
-    
-    % Convert back to sparse format to save space
-    Dy = sparse(Dy);
-    Dz = sparse(Dz);
 end
 
