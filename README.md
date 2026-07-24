@@ -12,6 +12,12 @@ This repo has two parts:
 
 ---
 
+## Data
+**Data example:** 
+https://bham-my.sharepoint.com/personal/jxz389_student_bham_ac_uk/_layouts/15/guestaccess.aspx?share=IgAKatRDsNM6TbeuVfDRraCQAQmIAt-RV0QJX_iUzaoYneE&e=pChWhE
+
+**generate simulated data**: generate_data.m
+
 ## Repository Structure
 ```text
 .
