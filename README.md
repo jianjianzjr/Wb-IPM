@@ -16,7 +16,10 @@ This repo has two parts:
 **Data example:** 
 https://drive.google.com/drive/folders/1I8JqdZoXHIXP15o1AkR094UsCmw376-K?usp=sharing
 
-**generate simulated dataset**: WB-IPM/generate_data.m
+**Trained network:** 
+https://drive.google.com/drive/folders/1I8JqdZoXHIXP15o1AkR094UsCmw376-K?usp=sharing
+
+**Generate simulated dataset**: WB-IPM/generate_data.m
 
 ## Repository Structure
 ```text
